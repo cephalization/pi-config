@@ -1,23 +1,11 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 
-const FRAME_INTERVAL_MS = 90;
-const ROTATION_STEP = 0.035;
+const ORB_ANGLE = 0.65;
 const TILT = -0.28;
 
 class OrbHeader implements Component {
-	private angle = 0;
-	private readonly timer: ReturnType<typeof setInterval>;
-
-	constructor(
-		private readonly tui: TUI,
-		private readonly theme: Theme,
-	) {
-		this.timer = setInterval(() => {
-			this.angle = (this.angle + ROTATION_STEP) % (Math.PI * 2);
-			this.tui.requestRender();
-		}, FRAME_INTERVAL_MS);
-	}
+	constructor(private readonly theme: Theme) {}
 
 	render(width: number): string[] {
 		if (width < 32) return [];
@@ -26,8 +14,8 @@ class OrbHeader implements Component {
 		const orbWidth = width >= 100 ? 34 : width >= 60 ? 24 : 16;
 		const canvas = Array.from({ length: height }, () => Array<string>(orbWidth).fill(" "));
 		const depth = Array.from({ length: height }, () => Array<number>(orbWidth).fill(-Infinity));
-		const cosA = Math.cos(this.angle);
-		const sinA = Math.sin(this.angle);
+		const cosA = Math.cos(ORB_ANGLE);
+		const sinA = Math.sin(ORB_ANGLE);
 		const cosTilt = Math.cos(TILT);
 		const sinTilt = Math.sin(TILT);
 		const radiusX = (orbWidth - 2) / 2;
@@ -55,7 +43,7 @@ class OrbHeader implements Component {
 				if (finalZ <= depth[row]![column]!) continue;
 
 				depth[row]![column] = finalZ;
-				const shimmer = Math.sin(phi * 3 + this.angle * 1.7) * 0.13;
+				const shimmer = Math.sin(phi * 3 + ORB_ANGLE * 1.7) * 0.13;
 				const light = finalZ * 0.7 - rotatedX * 0.25 - rotatedY * 0.15 + shimmer;
 				canvas[row]![column] = light > 0.55 ? "*" : light > 0.15 ? "+" : light > -0.3 ? ":" : ".";
 			}
@@ -70,10 +58,6 @@ class OrbHeader implements Component {
 	}
 
 	invalidate(): void {}
-
-	dispose(): void {
-		clearInterval(this.timer);
-	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -81,7 +65,7 @@ export default function (pi: ExtensionAPI) {
 
 	const apply = (ctx: ExtensionContext) => {
 		if (ctx.mode !== "tui") return;
-		ctx.ui.setHeader(enabled ? (tui, theme) => new OrbHeader(tui, theme) : undefined);
+		ctx.ui.setHeader(enabled ? (_tui, theme) => new OrbHeader(theme) : undefined);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {

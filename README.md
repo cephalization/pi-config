@@ -31,4 +31,4 @@ pi update --extensions
 ## Extensions
 
 - `github-pr-status.ts` — shows the pull request associated with the current Git branch in Pi's footer.
-- `orb-header.ts` — renders a faded, rotating ASCII point-cloud orb in Pi's startup header. Toggle it with `/orb`.
+- `orb-header.ts` — renders a faded ASCII point-cloud orb in Pi's startup header. Toggle it with `/orb`.
