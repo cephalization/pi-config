@@ -20,6 +20,8 @@ const MAX_ISSUES = 100;
 const MAX_RECENT_COMMENTS = 5;
 const MAX_BODY_CHARS = 12_000;
 const MAX_COMMENT_CHARS = 4_000;
+const MIN_ISSUE_TITLE_COLUMN_WIDTH = 72;
+const MAX_ISSUE_TITLE_COLUMN_WIDTH = 110;
 const ISSUE_CONTEXT_TYPE = "github-issue-context";
 const ISSUE_STATUS_ID = "active-github-issue";
 
@@ -131,13 +133,21 @@ class IssuePicker implements Component {
 			? fuzzyFilter(this.issues, this.filter, issueSearchText)
 			: this.issues;
 		this.selectedIssue = this.filteredIssues[0];
-		this.list = new SelectList(issueItems(this.filteredIssues), 10, {
-			selectedPrefix: (text) => this.theme.fg("accent", text),
-			selectedText: (text) => this.theme.fg("accent", text),
-			description: (text) => this.theme.fg("muted", text),
-			scrollInfo: (text) => this.theme.fg("dim", text),
-			noMatch: (text) => this.theme.fg("warning", text),
-		});
+		this.list = new SelectList(
+			issueItems(this.filteredIssues),
+			10,
+			{
+				selectedPrefix: (text) => this.theme.fg("accent", text),
+				selectedText: (text) => this.theme.fg("accent", text),
+				description: (text) => this.theme.fg("muted", text),
+				scrollInfo: (text) => this.theme.fg("dim", text),
+				noMatch: (text) => this.theme.fg("warning", text),
+			},
+			{
+				minPrimaryColumnWidth: MIN_ISSUE_TITLE_COLUMN_WIDTH,
+				maxPrimaryColumnWidth: MAX_ISSUE_TITLE_COLUMN_WIDTH,
+			},
+		);
 		this.list.onSelectionChange = (item) => {
 			this.selectedIssue = this.filteredIssues.find((issue) => issue.number === Number(item.value));
 		};
