@@ -630,7 +630,11 @@ export default function (pi: ExtensionAPI) {
 					{ deliverAs: "nextTurn" },
 				);
 				pi.setSessionName(`#${issue.number} — ${issue.title}`);
-				ctx.ui.setStatus(ISSUE_STATUS_ID, ctx.ui.theme.fg("accent", `Issue #${issue.number}`));
+				const issueStatus = ctx.ui.theme.fg("accent", `Issue #${issue.number}`);
+				ctx.ui.setStatus(
+					ISSUE_STATUS_ID,
+					`\u001b]8;;${issue.url}\u0007${issueStatus}\u001b]8;;\u0007`,
+				);
 				ctx.ui.setEditorText(
 					branch
 						? `Let's work on #${issue.number}. Start by reviewing the issue and locating the relevant code before making changes.`

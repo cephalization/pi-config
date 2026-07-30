@@ -68,14 +68,12 @@ export default function (pi: ExtensionAPI) {
 
 			const pr = JSON.parse(prResult.stdout) as PullRequest;
 			const state = pr.isDraft ? "draft" : pr.state.toLowerCase();
-			const label = `PR #${pr.number}`;
-			const linkedLabel = `\u001b]8;;${pr.url}\u0007${label}\u001b]8;;\u0007`;
 			const theme = ctx.ui.theme;
-			ctx.ui.setStatus(
-				STATUS_ID,
-				theme.fg("accent", linkedLabel) +
-					theme.fg("dim", ` · ${truncateTitle(pr.title)} · ${state}`),
-			);
+			const statusText =
+				theme.fg("accent", `PR #${pr.number}`) +
+				theme.fg("dim", ` · ${truncateTitle(pr.title)} · ${state}`);
+			const linkedStatus = `\u001b]8;;${pr.url}\u0007${statusText}\u001b]8;;\u0007`;
+			ctx.ui.setStatus(STATUS_ID, linkedStatus);
 		} catch {
 			clearStatus(ctx);
 		} finally {
