@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_ID = "github-pr";
-const BRANCH_POLL_INTERVAL_MS = 2_000;
+const BRANCH_POLL_INTERVAL_MS = 60_000;
 const PR_REFRESH_INTERVAL_MS = 60_000;
 const COMMAND_TIMEOUT_MS = 10_000;
 const MAX_TITLE_LENGTH = 60;
