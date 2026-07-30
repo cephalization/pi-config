@@ -30,5 +30,17 @@ pi update --extensions
 
 ## Extensions
 
+- `council.ts` — `/council <models...>` enables a persistent council of randomly named, independently opinionated model advisers. While enabled, each prompt is sent to every elder in a randomized sequential order using read-only repository tools. Use `/council` to toggle, `/council off`, or `/council status`.
 - `github-pr-status.ts` — shows the pull request associated with the current Git branch in Pi's footer.
 - `issue-pickup.ts` — `/pickup [filter]` finds assigned issues in the current GitHub repository, optionally creates a `<github-login>/issue/...` branch from a fuzzy-searchable base, loads the issue into the session context, and restores or infers the active issue status from the branch and its PR.
+
+### Council examples
+
+```text
+/council fable sol opus-4-5
+/council status
+/council off
+/council          # re-enable the configured elders
+```
+
+Model arguments are fuzzy-matched against authenticated models. While deliberating, a live widget above the editor shows per-elder progress (✓ done, spinner active, ○ pending, ✗ failed) with elapsed times, and the status bar shows the active elder and round progress, ending with a brief `adjourned` state. Messages sent mid-round are queued and put to the council as a follow-up round when the current one finishes; `/council off` stops an in-flight deliberation and clears the queue. The speaking order is reshuffled for every prompt. The first elder gets an unbiased first pass; each later elder also sees the earlier contributions from that round and is instructed to engage, refine, or challenge them rather than merely agree. This creates a bounded single-pass debate without paying for a separate rebuttal round. Council subprocesses can inspect the project with `read`, `grep`, `find`, and `ls`; they cannot edit files or run shell commands.
