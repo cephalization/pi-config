@@ -1,6 +1,7 @@
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -23,6 +24,8 @@ const MAX_BODY_CHARS = 12_000;
 const MAX_COMMENT_CHARS = 4_000;
 const MIN_ISSUE_TITLE_COLUMN_WIDTH = 72;
 const MAX_ISSUE_TITLE_COLUMN_WIDTH = 110;
+const BRANCH_POLL_INTERVAL_MS = 2_000;
+const ISSUE_REFRESH_INTERVAL_MS = 60_000;
 const ISSUE_CONTEXT_TYPE = "github-issue-context";
 const ISSUE_STATUS_ID = "active-github-issue";
 
@@ -52,12 +55,109 @@ type RepoInfo = {
 };
 type UserInfo = { login: string };
 type PickupAction = "branch" | "discuss";
+type IssueStatus = { number: number; url: string };
+type IssueContextDetails = {
+	issue: number;
+	url: string;
+	repo?: string;
+	branch?: string;
+	statusBranch?: string;
+	base?: string;
+};
+type PullRequestIssueData = {
+	body: string;
+	closingIssuesReferences: Array<{ number: number; url: string }>;
+};
 
 type CommandResult = {
 	code: number;
 	stderr: string;
 	stdout: string;
 };
+
+function setIssueStatus(ctx: ExtensionContext, issue: IssueStatus | undefined): void {
+	if (!issue) {
+		ctx.ui.setStatus(ISSUE_STATUS_ID, undefined);
+		return;
+	}
+	const text = ctx.ui.theme.fg("accent", `Issue #${issue.number}`);
+	ctx.ui.setStatus(ISSUE_STATUS_ID, `\u001b]8;;${issue.url}\u0007${text}\u001b]8;;\u0007`);
+}
+
+function issueNumberFromBranch(branch: string): number | undefined {
+	const explicit = branch.match(/(?:^|\/)issue[/-](\d+)(?:[-/]|$)/i);
+	if (explicit) return Number(explicit[1]);
+	const numericSegment = branch.match(/(?:^|\/)(\d{3,})(?:[-/]|$)/);
+	return numericSegment ? Number(numericSegment[1]) : undefined;
+}
+
+function issueNumberFromPullRequestBody(body: string): number | undefined {
+	const closingReference = body.match(
+		/(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?[ \t]*(?:[\w.-]+\/[\w.-]+)?#(\d+)/i,
+	);
+	if (closingReference) return Number(closingReference[1]);
+	const firstReference = body.match(/#(\d+)/);
+	return firstReference ? Number(firstReference[1]) : undefined;
+}
+
+function restoreIssueFromSession(ctx: ExtensionContext): { issue: IssueStatus; branch?: string } | undefined {
+	for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+		if (entry.type !== "custom_message" || entry.customType !== ISSUE_CONTEXT_TYPE) continue;
+		const details = entry.details as IssueContextDetails | undefined;
+		if (details?.issue && details.url) {
+			return {
+				issue: { number: details.issue, url: details.url },
+				branch: details.statusBranch ?? details.branch,
+			};
+		}
+	}
+	return undefined;
+}
+
+async function verifyIssue(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	number: number,
+): Promise<IssueStatus | undefined> {
+	const result = await pi.exec("gh", ["issue", "view", String(number), "--json", "number,url"], {
+		cwd: ctx.cwd,
+		timeout: COMMAND_TIMEOUT_MS,
+	});
+	if (result.code !== 0) return undefined;
+	try {
+		return JSON.parse(result.stdout) as IssueStatus;
+	} catch {
+		return undefined;
+	}
+}
+
+async function inferIssueFromBranch(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	branch: string,
+): Promise<IssueStatus | undefined> {
+	const branchIssueNumber = issueNumberFromBranch(branch);
+	if (branchIssueNumber) {
+		const issue = await verifyIssue(pi, ctx, branchIssueNumber);
+		if (issue) return issue;
+	}
+
+	const prResult = await pi.exec(
+		"gh",
+		["pr", "view", branch, "--json", "body,closingIssuesReferences"],
+		{ cwd: ctx.cwd, timeout: COMMAND_TIMEOUT_MS },
+	);
+	if (prResult.code !== 0) return undefined;
+	try {
+		const pr = JSON.parse(prResult.stdout) as PullRequestIssueData;
+		const closingIssue = pr.closingIssuesReferences?.[0];
+		if (closingIssue) return { number: closingIssue.number, url: closingIssue.url };
+		const bodyIssueNumber = issueNumberFromPullRequestBody(pr.body || "");
+		return bodyIssueNumber ? verifyIssue(pi, ctx, bodyIssueNumber) : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 function commandError(command: string, result: CommandResult): string {
 	return result.stderr.trim() || result.stdout.trim() || `${command} exited with code ${result.code}`;
@@ -548,6 +648,53 @@ function buildIssueContext(
 }
 
 export default function (pi: ExtensionAPI) {
+	let activeIssue: IssueStatus | undefined;
+	let activeIssueBranch: string | undefined;
+	let lastBranch: string | undefined;
+	let lastIssueCheck = 0;
+	let refreshingIssue = false;
+	let issueTimer: ReturnType<typeof setInterval> | undefined;
+
+	const refreshIssueStatus = async (ctx: ExtensionContext, force = false) => {
+		if (refreshingIssue) return;
+		refreshingIssue = true;
+		try {
+			const branchResult = await pi.exec("git", ["branch", "--show-current"], {
+				cwd: ctx.cwd,
+				timeout: COMMAND_TIMEOUT_MS,
+			});
+			const branch = branchResult.code === 0 ? branchResult.stdout.trim() : "";
+			if (!branch) {
+				activeIssue = undefined;
+				activeIssueBranch = undefined;
+				lastBranch = undefined;
+				setIssueStatus(ctx, undefined);
+				return;
+			}
+
+			const branchChanged = branch !== lastBranch;
+			const refreshDue = Date.now() - lastIssueCheck >= ISSUE_REFRESH_INTERVAL_MS;
+			if (!force && !branchChanged && !refreshDue) return;
+			lastBranch = branch;
+			lastIssueCheck = Date.now();
+
+			if (activeIssue && (!activeIssueBranch || activeIssueBranch === branch)) {
+				setIssueStatus(ctx, activeIssue);
+				return;
+			}
+
+			activeIssue = await inferIssueFromBranch(pi, ctx, branch);
+			activeIssueBranch = activeIssue ? branch : undefined;
+			setIssueStatus(ctx, activeIssue);
+		} catch {
+			activeIssue = undefined;
+			activeIssueBranch = undefined;
+			setIssueStatus(ctx, undefined);
+		} finally {
+			refreshingIssue = false;
+		}
+	};
+
 	pi.registerMessageRenderer(ISSUE_CONTEXT_TYPE, (message, options, theme) => {
 		const details = message.details as
 			| { repo?: string; issue?: number; url?: string; branch?: string; base?: string }
@@ -559,8 +706,21 @@ export default function (pi: ExtensionAPI) {
 		return new Text(text, options.outputPad, 0);
 	});
 
+	pi.on("session_start", async (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		const restored = restoreIssueFromSession(ctx);
+		activeIssue = restored?.issue;
+		activeIssueBranch = restored?.branch;
+		lastBranch = undefined;
+		lastIssueCheck = 0;
+		await refreshIssueStatus(ctx, true);
+		issueTimer = setInterval(() => void refreshIssueStatus(ctx), BRANCH_POLL_INTERVAL_MS);
+	});
+
 	pi.on("session_shutdown", async (_event, ctx) => {
-		ctx.ui.setStatus(ISSUE_STATUS_ID, undefined);
+		if (issueTimer) clearInterval(issueTimer);
+		issueTimer = undefined;
+		setIssueStatus(ctx, undefined);
 	});
 
 	pi.registerCommand("pickup", {
@@ -619,22 +779,35 @@ export default function (pi: ExtensionAPI) {
 					base = prepared.base;
 					stashed = prepared.stashed;
 				}
+				let statusBranch = branch;
+				if (!statusBranch) {
+					const currentBranch = await pi.exec("git", ["branch", "--show-current"], {
+						cwd: ctx.cwd,
+						timeout: COMMAND_TIMEOUT_MS,
+					});
+					statusBranch = currentBranch.code === 0 ? currentBranch.stdout.trim() || undefined : undefined;
+				}
 
 				pi.sendMessage(
 					{
 						customType: ISSUE_CONTEXT_TYPE,
 						content: buildIssueContext(repo, issue, branch, base),
 						display: true,
-						details: { repo: repo.nameWithOwner, issue: issue.number, url: issue.url, branch, base },
+						details: {
+							repo: repo.nameWithOwner,
+							issue: issue.number,
+							url: issue.url,
+							branch,
+							statusBranch,
+							base,
+						},
 					},
 					{ deliverAs: "nextTurn" },
 				);
 				pi.setSessionName(`#${issue.number} — ${issue.title}`);
-				const issueStatus = ctx.ui.theme.fg("accent", `Issue #${issue.number}`);
-				ctx.ui.setStatus(
-					ISSUE_STATUS_ID,
-					`\u001b]8;;${issue.url}\u0007${issueStatus}\u001b]8;;\u0007`,
-				);
+				activeIssue = { number: issue.number, url: issue.url };
+				activeIssueBranch = statusBranch;
+				setIssueStatus(ctx, activeIssue);
 				ctx.ui.setEditorText(
 					branch
 						? `Let's work on #${issue.number}. Start by reviewing the issue and locating the relevant code before making changes.`

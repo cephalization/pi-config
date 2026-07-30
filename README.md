@@ -31,4 +31,4 @@ pi update --extensions
 ## Extensions
 
 - `github-pr-status.ts` — shows the pull request associated with the current Git branch in Pi's footer.
-- `issue-pickup.ts` — `/pickup [filter]` finds assigned issues in the current GitHub repository, optionally creates a `<github-login>/issue/...` branch from a fuzzy-searchable base, and loads the issue into the session context.
+- `issue-pickup.ts` — `/pickup [filter]` finds assigned issues in the current GitHub repository, optionally creates a `<github-login>/issue/...` branch from a fuzzy-searchable base, loads the issue into the session context, and restores or infers the active issue status from the branch and its PR.
