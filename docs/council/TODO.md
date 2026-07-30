@@ -34,9 +34,14 @@ of `extensions/council.ts`.
       elders can read anything the user can read (`~/.ssh`, `auth.json`); `AGENTS.md`/issue text is
       an injection channel into every elder; a leaked secret fans out to N providers and persists in
       the session JSONL. Advise against council mode in untrusted repos. (Elm S2)
-- [ ] **Recursion guard.** Comment that `--no-extensions` is a load-bearing safety invariant, and
-      add a belt-and-braces `PI_COUNCIL=1` env marker set on children and checked at the top of the
-      input handler. (Elm S6)
+- [ ] **Recursion guard.** `--no-extensions` is now commented as a load-bearing safety invariant
+      (the bash gate is the only extension explicitly re-added via `-e`); still add a belt-and-braces
+      `PI_COUNCIL=1` env marker set on children and checked at the top of the input handler. (Elm S6)
+- [ ] **Bash gate hardening.** Children now get a gated `bash` tool
+      (`extensions/council/bash-gate.ts`: allowlisted read-only `gh`/`git` + pipe filters, control
+      operators rejected). Follow-ups: unit tests for the tokenizer/allowlist, review `gh api` GET
+      exfiltration surface (a poisoned repo could instruct an elder to GET a URL embedding secrets
+      read from disk), and consider logging gated command approvals to the parent.
 
 ## P1 — Control flow and correctness
 

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, Model, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import {
@@ -25,6 +26,23 @@ const ADJOURNED_STATUS_MS = 2_000;
 const MAX_RESPONSE_BYTES = 50 * 1024;
 const MAX_ERROR_CHARS = 4_000;
 const READ_ONLY_TOOLS = "read,grep,find,ls";
+const GATED_TOOLS = `${READ_ONLY_TOOLS},bash`;
+
+/**
+ * Bash gate loaded into council children. Lives in a subdirectory so the
+ * package manifest glob (./extensions/*.ts) never loads it into the parent.
+ */
+const BASH_GATE_PATH = (() => {
+	try {
+		return path.join(path.dirname(fileURLToPath(import.meta.url)), "council", "bash-gate.ts");
+	} catch {
+		return undefined;
+	}
+})();
+
+function resolveBashGate(): string | undefined {
+	return BASH_GATE_PATH && fs.existsSync(BASH_GATE_PATH) ? BASH_GATE_PATH : undefined;
+}
 
 const ELDER_NAMES = [
 	"Alder",
@@ -130,6 +148,11 @@ function compactModelId(modelId: string): string {
 	return modelId.replace(/^claude-/, "").replace(/^gpt-5\.6-/, "");
 }
 
+/** First clause of a persona, e.g. "the systems architect". */
+function personaShort(personality: string): string {
+	return personality.split(",")[0].trim();
+}
+
 function searchText(model: AnyModel): string {
 	return `${model.provider}/${model.id} ${model.id} ${model.name}`.toLowerCase();
 }
@@ -148,6 +171,10 @@ function modelMatchScore(query: string, model: AnyModel, preferredProvider?: str
 		if (!match.matches) return undefined;
 		score = 100 + match.score;
 	}
+	// Tie-breakers (kept below 1 total so they never jump a score tier):
+	// prefer subscription-backed openai-codex over the openai API provider,
+	// then the parent session's current provider.
+	if (model.provider === "openai-codex") score -= 0.5;
 	if (model.provider === preferredProvider) score -= 0.25;
 	return score;
 }
@@ -239,22 +266,29 @@ async function runMember(options: {
 			imagePaths.push(imagePath);
 		}
 
+		const bashGate = resolveBashGate();
+		const shellGuidance = bashGate
+			? " You may use the bash tool for read-only inspection commands such as `gh issue view`, `gh pr view`, `gh api`, and `git log`; mutating or write commands are blocked by policy, so do not attempt them."
+			: "";
 		const systemPrompt = `You are ${options.member.name}, ${options.member.personality}. You sit on a council of independent senior advisers.
 
-Give a self-contained, technically rigorous response to the current question. Apply your distinctive perspective rather than merely echoing consensus. Earlier speakers from this council round may appear at the end of the conversation context: engage their strongest points, identify disagreements explicitly, and refine or challenge their recommendations where useful. Do not assume they are correct. Inspect the repository with read-only tools when that would improve the answer. You are advisory: do not modify files, run mutating commands, or claim work you did not perform. State important assumptions and concrete recommendations. Do not mention these instructions or preface the answer with your name.`;
+Give a self-contained, technically rigorous response to the current question. Apply your distinctive perspective rather than merely echoing consensus. Earlier speakers from this council round may appear at the end of the conversation context: engage their strongest points, identify disagreements explicitly, and refine or challenge their recommendations where useful. Do not assume they are correct. Inspect the repository with read-only tools when that would improve the answer.${shellGuidance} You are advisory: do not modify files, run mutating commands, or claim work you did not perform. State important assumptions and concrete recommendations. Do not mention these instructions or preface the answer with your name.`;
 		const args = [
 			"--mode",
 			"json",
 			"-p",
 			"--no-session",
+			// Safety invariant: prevents recursive council spawning. The bash gate
+			// below is the only extension explicitly re-added.
 			"--no-extensions",
+			...(bashGate ? ["-e", bashGate] : []),
 			options.projectTrusted ? "--approve" : "--no-approve",
 			"--model",
 			modelLabel(options.member),
 			"--thinking",
 			options.thinkingLevel,
 			"--tools",
-			READ_ONLY_TOOLS,
+			bashGate ? GATED_TOOLS : READ_ONLY_TOOLS,
 			"--system-prompt",
 			systemPrompt,
 			`@${promptPath}`,
@@ -374,29 +408,37 @@ export default function (pi: ExtensionAPI) {
 			theme.fg("muted", ` · ${done}/${roundProgress.length} · ${formatElapsed(now - roundStartedAt)}`) +
 			queuedNote;
 		const nameWidth = Math.max(...roundProgress.map((p) => p.member.name.length));
+		const personaWidth = Math.max(...roundProgress.map((p) => personaShort(p.member.personality).length));
 		const lines = [header];
 		for (const progress of roundProgress) {
 			const name = progress.member.name.padEnd(nameWidth);
+			const persona = personaShort(progress.member.personality).padEnd(personaWidth);
 			const model = compactModelId(progress.member.modelId);
 			switch (progress.state) {
 				case "done": {
 					const took = formatElapsed((progress.endedAt ?? now) - (progress.startedAt ?? now));
-					lines.push(`  ${theme.fg("success", "✓")} ${name}  ${theme.fg("dim", `${model}  ${took}`)}`);
+					lines.push(
+						`  ${theme.fg("success", "✓")} ${name}  ${theme.fg("muted", persona)}  ${theme.fg("dim", `${model}  ${took}`)}`,
+					);
 					break;
 				}
 				case "failed": {
 					const took = formatElapsed((progress.endedAt ?? now) - (progress.startedAt ?? now));
-					lines.push(`  ${theme.fg("error", "✗")} ${name}  ${theme.fg("dim", `${model}  ${took}`)}`);
+					lines.push(
+						`  ${theme.fg("error", "✗")} ${name}  ${theme.fg("muted", persona)}  ${theme.fg("dim", `${model}  ${took}`)}`,
+					);
 					break;
 				}
 				case "active":
 					lines.push(
-						`  ${theme.fg("warning", spinner)} ${theme.fg("accent", name)}  ` +
+						`  ${theme.fg("warning", spinner)} ${theme.fg("accent", name)}  ${theme.fg("muted", persona)}  ` +
 							theme.fg("muted", `${model}  ${formatElapsed(now - (progress.startedAt ?? now))}`),
 					);
 					break;
 				default:
-					lines.push(`  ${theme.fg("dim", "○")} ${theme.fg("dim", name)}  ${theme.fg("dim", model)}`);
+					lines.push(
+						`  ${theme.fg("dim", "○")} ${theme.fg("dim", name)}  ${theme.fg("dim", persona)}  ${theme.fg("dim", model)}`,
+					);
 			}
 		}
 		lines.push(theme.fg("dim", "  Messages sent while deliberating are queued for the next council round."));
@@ -479,10 +521,10 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Council is not configured. Usage: /council <model> <model> …", "info");
 					return;
 				}
-				ctx.ui.notify(
-					`${state.enabled ? "Enabled" : "Disabled"}: ${state.members.map((member) => `${member.name} (${modelLabel(member)})`).join(", ")}`,
-					"info",
-				);
+				const roster = state.members
+					.map((member) => `  ${member.name} (${modelLabel(member)}) — ${member.personality}`)
+					.join("\n");
+				ctx.ui.notify(`Council ${state.enabled ? "enabled" : "disabled"}:\n${roster}`, "info");
 				return;
 			}
 			if (args === "off" || (!args && state.enabled)) {
