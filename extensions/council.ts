@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, Model, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
+import { complete, type UserMessage } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	type ExtensionAPI,
@@ -96,7 +97,27 @@ type CouncilMessageDetails =
 			member: CouncilMember;
 			usage?: Usage;
 			error?: string;
+	  }
+	| {
+			kind: "summary";
+			text: string;
+			model: string;
+			usage?: Usage;
+			error?: string;
 	  };
+
+type Contribution = { member: CouncilMember; text: string; error?: string };
+
+const CHAIR_SYSTEM_PROMPT = `You are the Chair of a council of independent senior advisers. The user provides the question that was put to the council and each elder's full deliberation.
+
+Synthesize the deliberations into a single brief the user can act on without reading every argument:
+
+1. **Verdict** — the council's bottom line in one or two sentences.
+2. **Consensus** — points where the elders substantively agree.
+3. **Disputes & rulings** — material disagreements; for each, rule in favor of a side and justify the tie-break in one sentence.
+4. **Read further** — which elder(s) to read in full for the most valuable depth, and why.
+
+Aim for under 300 words. Attribute positions to elders by name. Do not invent positions no elder took. If an elder failed to respond, note it briefly.`;
 
 type ChildResult = {
 	text: string;
@@ -109,6 +130,7 @@ type MemberProgress = {
 	state: "pending" | "active" | "done" | "failed";
 	startedAt?: number;
 	endedAt?: number;
+	usage?: Usage;
 };
 
 type QueuedQuestion = { text: string; images: ImageContent[] };
@@ -151,6 +173,47 @@ function compactModelId(modelId: string): string {
 /** First clause of a persona, e.g. "the systems architect". */
 function personaShort(personality: string): string {
 	return personality.split(",")[0].trim();
+}
+
+function formatTokens(count: number): string {
+	if (count < 1000) return String(count);
+	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+	return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
+/** Compact usage summary, e.g. "↑3.1k ↓845 · $0.0123". */
+function formatUsage(usage: Usage): string {
+	const parts: string[] = [];
+	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
+	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+	if (usage.cost.total) parts.push(`$${usage.cost.total.toFixed(4)}`);
+	return parts.join(" ");
+}
+
+function emptyUsage(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function addUsage(total: Usage, delta: Usage): void {
+	total.input += delta.input || 0;
+	total.output += delta.output || 0;
+	total.cacheRead += delta.cacheRead || 0;
+	total.cacheWrite += delta.cacheWrite || 0;
+	total.totalTokens = Math.max(total.totalTokens, delta.totalTokens || 0);
+	total.cost.input += delta.cost?.input || 0;
+	total.cost.output += delta.cost?.output || 0;
+	total.cost.cacheRead += delta.cost?.cacheRead || 0;
+	total.cost.cacheWrite += delta.cost?.cacheWrite || 0;
+	total.cost.total += delta.cost?.total || 0;
 }
 
 function searchText(model: AnyModel): string {
@@ -251,6 +314,8 @@ async function runMember(options: {
 	thinkingLevel: ModelThinkingLevel;
 	projectTrusted: boolean;
 	signal: AbortSignal;
+	/** Called with the running usage total after each completed assistant turn. */
+	onUsage?: (usage: Usage) => void;
 }): Promise<ChildResult> {
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-council-"));
 	try {
@@ -300,6 +365,8 @@ Give a self-contained, technically rigorous response to the current question. Ap
 		let stderr = "";
 		let stdoutBuffer = "";
 		let lastAssistant: Message | undefined;
+		let sawUsage = false;
+		const totalUsage = emptyUsage();
 		let timedOut = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -328,6 +395,12 @@ Give a self-contained, technically rigorous response to the current question. Ap
 					const event = JSON.parse(line) as { type?: string; message?: Message };
 					if (event.type === "message_end" && event.message?.role === "assistant") {
 						lastAssistant = event.message;
+						// Accumulate across all turns (tool-using elders respond in several).
+						if (event.message.usage) {
+							sawUsage = true;
+							addUsage(totalUsage, event.message.usage);
+							options.onUsage?.({ ...totalUsage, cost: { ...totalUsage.cost } });
+						}
 					}
 				} catch {
 					// Ignore non-protocol output from child extensions/providers.
@@ -369,7 +442,7 @@ Give a self-contained, technically rigorous response to the current question. Ap
 		const error = lastAssistant.stopReason === "error" ? lastAssistant.errorMessage || "model error" : undefined;
 		return {
 			text: truncateResponse(text || (error ? `Unable to respond: ${error}` : "(No textual response.)")),
-			usage: lastAssistant.usage,
+			usage: sawUsage ? totalUsage : lastAssistant.usage,
 			error,
 		};
 	} finally {
@@ -403,9 +476,14 @@ export default function (pi: ExtensionAPI) {
 		const queuedNote = queuedQuestions.length
 			? theme.fg("warning", `  · ${queuedQuestions.length} question(s) queued for the next round`)
 			: "";
+		const roundUsage = emptyUsage();
+		for (const progress of roundProgress) {
+			if (progress.usage) addUsage(roundUsage, progress.usage);
+		}
+		const costNote = roundUsage.cost.total ? ` · $${roundUsage.cost.total.toFixed(4)}` : "";
 		const header =
 			theme.fg("accent", `${spinner} ⚖ Council deliberating`) +
-			theme.fg("muted", ` · ${done}/${roundProgress.length} · ${formatElapsed(now - roundStartedAt)}`) +
+			theme.fg("muted", ` · ${done}/${roundProgress.length} · ${formatElapsed(now - roundStartedAt)}${costNote}`) +
 			queuedNote;
 		const nameWidth = Math.max(...roundProgress.map((p) => p.member.name.length));
 		const personaWidth = Math.max(...roundProgress.map((p) => personaShort(p.member.personality).length));
@@ -415,26 +493,24 @@ export default function (pi: ExtensionAPI) {
 			const persona = personaShort(progress.member.personality).padEnd(personaWidth);
 			const model = compactModelId(progress.member.modelId);
 			switch (progress.state) {
-				case "done": {
-					const took = formatElapsed((progress.endedAt ?? now) - (progress.startedAt ?? now));
-					lines.push(
-						`  ${theme.fg("success", "✓")} ${name}  ${theme.fg("muted", persona)}  ${theme.fg("dim", `${model}  ${took}`)}`,
-					);
-					break;
-				}
+				case "done":
 				case "failed": {
+					const icon = progress.state === "done" ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const took = formatElapsed((progress.endedAt ?? now) - (progress.startedAt ?? now));
+					const usageNote = progress.usage ? `  ${formatUsage(progress.usage)}` : "";
 					lines.push(
-						`  ${theme.fg("error", "✗")} ${name}  ${theme.fg("muted", persona)}  ${theme.fg("dim", `${model}  ${took}`)}`,
+						`  ${icon} ${name}  ${theme.fg("muted", persona)}  ${theme.fg("dim", `${model}  ${took}${usageNote}`)}`,
 					);
 					break;
 				}
-				case "active":
+				case "active": {
+					const usageNote = progress.usage ? `  ${formatUsage(progress.usage)}` : "";
 					lines.push(
 						`  ${theme.fg("warning", spinner)} ${theme.fg("accent", name)}  ${theme.fg("muted", persona)}  ` +
-							theme.fg("muted", `${model}  ${formatElapsed(now - (progress.startedAt ?? now))}`),
+							theme.fg("muted", `${model}  ${formatElapsed(now - (progress.startedAt ?? now))}${usageNote}`),
 					);
 					break;
+				}
 				default:
 					lines.push(
 						`  ${theme.fg("dim", "○")} ${theme.fg("dim", name)}  ${theme.fg("dim", persona)}  ${theme.fg("dim", model)}`,
@@ -478,22 +554,37 @@ export default function (pi: ExtensionAPI) {
 			return container;
 		}
 
+		if (details.kind === "summary") {
+			const heading = `⚖ Council Chair · ${details.model}`;
+			container.addChild(
+				new Text(theme.fg(details.error ? "error" : "success", theme.bold(heading)), options.outputPad, 0),
+			);
+			container.addChild(new Spacer(1));
+			container.addChild(new Markdown(details.text, options.outputPad, 0, getMarkdownTheme()));
+			if (details.usage) {
+				const compact = formatUsage(details.usage);
+				if (compact) {
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", compact), options.outputPad, 0));
+				}
+			}
+			return container;
+		}
+
 		const heading = `${details.member.name} · ${modelLabel(details.member)}`;
 		container.addChild(new Text(theme.fg(details.error ? "error" : "accent", theme.bold(heading)), options.outputPad, 0));
 		container.addChild(new Text(theme.fg("dim", details.member.personality), options.outputPad, 0));
 		container.addChild(new Spacer(1));
 		container.addChild(new Markdown(details.text, options.outputPad, 0, getMarkdownTheme()));
-		if (options.expanded && details.usage) {
-			container.addChild(
-				new Text(
-					theme.fg(
-						"dim",
-						`↑${details.usage.input} ↓${details.usage.output} · $${details.usage.cost.total.toFixed(4)}`,
-					),
-					options.outputPad,
-					0,
-				),
-			);
+		if (details.usage) {
+			const compact = formatUsage(details.usage);
+			const expandedExtra = options.expanded
+				? ` · W${formatTokens(details.usage.cacheWrite)} · ctx:${formatTokens(details.usage.totalTokens)}`
+				: "";
+			if (compact || expandedExtra) {
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("dim", `${compact}${expandedExtra}`), options.outputPad, 0));
+			}
 		}
 		return container;
 	});
@@ -587,6 +678,7 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		const order = shuffle(state.members);
+		const contributions: Contribution[] = [];
 		startWidget(ctx, order);
 		for (let index = 0; index < order.length; index++) {
 			const member = order[index];
@@ -616,6 +708,9 @@ export default function (pi: ExtensionAPI) {
 					thinkingLevel: ctx.thinkingLevel,
 					projectTrusted: ctx.isProjectTrusted(),
 					signal: controller.signal,
+					onUsage: (usage) => {
+						if (progress) progress.usage = usage;
+					},
 				});
 			} catch (error) {
 				const message = (error instanceof Error ? error.message : String(error)).slice(0, MAX_ERROR_CHARS);
@@ -624,9 +719,11 @@ export default function (pi: ExtensionAPI) {
 			if (progress) {
 				progress.state = result.error ? "failed" : "done";
 				progress.endedAt = Date.now();
+				progress.usage = result.usage;
 			}
 			refreshWidget(ctx);
 			if (controller.signal.aborted) break;
+			contributions.push({ member, text: result.text, error: result.error });
 			if (!result.error) {
 				conversation += `\n\n--- Earlier council contribution: ${member.name} (${modelLabel(member)}) ---\n${result.text}`;
 			}
@@ -644,6 +741,89 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (controller.signal.aborted) break;
 		}
+		if (!controller.signal.aborted) {
+			await runChair(ctx, question, contributions, controller);
+		}
+	};
+
+	/** In-process synthesis of the round by the primary session model. */
+	const runChair = async (
+		ctx: ExtensionContext,
+		question: string,
+		contributions: Contribution[],
+		controller: AbortController,
+	): Promise<void> => {
+		const successful = contributions.filter((entry) => !entry.error);
+		if (successful.length < 2) return; // Nothing to reconcile.
+		const chairModel = ctx.model;
+		if (!chairModel) {
+			ctx.ui.notify("Council chair skipped: no session model selected", "warning");
+			return;
+		}
+		const chairLabel = `${chairModel.provider}/${chairModel.id}`;
+		const chairProgress: MemberProgress = {
+			member: {
+				modelId: chairModel.id,
+				provider: chairModel.provider,
+				name: "The Chair",
+				personality: "presiding, synthesizes the round and rules on disputes",
+			},
+			state: "active",
+			startedAt: Date.now(),
+		};
+		roundProgress?.push(chairProgress);
+		refreshWidget(ctx);
+		ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("warning", `⚖ Council · the Chair is synthesizing · ${compactModelId(chairModel.id)}`));
+
+		let text: string;
+		let usage: Usage | undefined;
+		let error: string | undefined;
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(chairModel);
+			if (!auth.ok) throw new Error(auth.error);
+			const body = contributions
+				.map(
+					(entry) =>
+						`## ${entry.member.name} (${modelLabel(entry.member)}) — ${entry.member.personality}${entry.error ? " [failed to respond]" : ""}\n\n${entry.text}`,
+				)
+				.join("\n\n---\n\n");
+			const userMessage: UserMessage = {
+				role: "user",
+				content: [{ type: "text", text: `# Question put to the council\n\n${question}\n\n# Deliberations\n\n${body}` }],
+				timestamp: Date.now(),
+			};
+			const response = await complete(
+				chairModel,
+				{ systemPrompt: CHAIR_SYSTEM_PROMPT, messages: [userMessage] },
+				{ apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal: controller.signal, cacheRetention: "none" },
+			);
+			if (response.stopReason === "aborted") {
+				chairProgress.state = "failed";
+				chairProgress.endedAt = Date.now();
+				return;
+			}
+			usage = response.usage;
+			error = response.stopReason === "error" ? response.errorMessage || "model error" : undefined;
+			text =
+				response.content
+					.filter((part): part is { type: "text"; text: string } => part.type === "text")
+					.map((part) => part.text)
+					.join("\n")
+					.trim() || (error ? `Unable to synthesize: ${error}` : "(No synthesis produced.)");
+		} catch (chairError) {
+			error = (chairError instanceof Error ? chairError.message : String(chairError)).slice(0, MAX_ERROR_CHARS);
+			text = `Unable to synthesize: ${error}`;
+		}
+		chairProgress.state = error ? "failed" : "done";
+		chairProgress.endedAt = Date.now();
+		chairProgress.usage = usage;
+		refreshWidget(ctx);
+		pi.sendMessage({
+			customType: MESSAGE_TYPE,
+			content: `<council_summary chair="${chairLabel}">\n${text}\n</council_summary>`,
+			display: true,
+			details: { kind: "summary", text, model: chairLabel, usage, error } satisfies CouncilMessageDetails,
+		});
 	};
 
 	pi.on("input", async (event, ctx) => {
