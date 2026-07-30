@@ -17,6 +17,7 @@ import {
 
 const COMMAND_TIMEOUT_MS = 15_000;
 const MAX_ISSUES = 100;
+const MAX_BASE_BRANCHES = 200;
 const MAX_RECENT_COMMENTS = 5;
 const MAX_BODY_CHARS = 12_000;
 const MAX_COMMENT_CHARS = 4_000;
@@ -90,14 +91,14 @@ function issueSearchText(issue: Issue): string {
 	return `${issue.number} ${issue.title} ${issue.labels.map((label) => label.name).join(" ")} ${issue.body}`;
 }
 
-function branchSlug(issue: Issue): string {
+function branchSlug(issue: Issue, githubLogin: string): string {
 	const slug = issue.title
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-|-$/g, "")
 		.slice(0, 48)
 		.replace(/-$/g, "");
-	return `issue/${issue.number}-${slug || "work"}`;
+	return `${githubLogin}/issue/${issue.number}-${slug || "work"}`;
 }
 
 function issueItems(issues: Issue[]): SelectItem[] {
@@ -110,6 +111,78 @@ function issueItems(issues: Issue[]): SelectItem[] {
 			description: metadata,
 		};
 	});
+}
+
+class FuzzyStringPicker implements Component {
+	private filter = "";
+	private filteredValues: string[] = [];
+	private list!: SelectList;
+
+	constructor(
+		private readonly title: string,
+		private readonly values: string[],
+		private readonly theme: Theme,
+		private readonly done: (value: string | undefined) => void,
+	) {
+		this.rebuildList();
+	}
+
+	private rebuildList(): void {
+		this.filteredValues = this.filter ? fuzzyFilter(this.values, this.filter, (value) => value) : this.values;
+		this.list = new SelectList(
+			this.filteredValues.map((value) => ({ value, label: value })),
+			12,
+			{
+				selectedPrefix: (text) => this.theme.fg("accent", text),
+				selectedText: (text) => this.theme.fg("accent", text),
+				description: (text) => this.theme.fg("muted", text),
+				scrollInfo: (text) => this.theme.fg("dim", text),
+				noMatch: (text) => this.theme.fg("warning", text),
+			},
+			{ minPrimaryColumnWidth: 60, maxPrimaryColumnWidth: 110 },
+		);
+		this.list.onSelect = (item) => this.done(item.value);
+		this.list.onCancel = () => this.done(undefined);
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const border = this.theme.fg("border", "─".repeat(safeWidth));
+		const query = this.filter || this.theme.fg("dim", "type to fuzzy filter");
+		return [
+			border,
+			truncateToWidth(`${this.theme.fg("accent", this.theme.bold(this.title))}  ${query}`, safeWidth),
+			this.theme.fg("dim", `${this.filteredValues.length}/${this.values.length} branches`),
+			"",
+			...this.list.render(safeWidth),
+			"",
+			this.theme.fg("dim", "↑↓ select · enter confirm · type filter · ctrl+u clear · esc cancel"),
+			border,
+		].map((line) => truncateToWidth(line, safeWidth, ""));
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.backspace)) {
+			this.filter = this.filter.slice(0, -1);
+			this.rebuildList();
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("u"))) {
+			this.filter = "";
+			this.rebuildList();
+			return;
+		}
+		if (data.length === 1 && data.charCodeAt(0) >= 32 && !matchesKey(data, Key.enter)) {
+			this.filter += data;
+			this.rebuildList();
+			return;
+		}
+		this.list.handleInput(data);
+	}
+
+	invalidate(): void {
+		this.list.invalidate();
+	}
 }
 
 class IssuePicker implements Component {
@@ -246,6 +319,24 @@ async function chooseIssue(
 	});
 }
 
+async function chooseFuzzyString(
+	ctx: ExtensionCommandContext,
+	title: string,
+	values: string[],
+): Promise<string | undefined> {
+	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
+		const picker = new FuzzyStringPicker(title, values, theme, done);
+		return {
+			render: (width) => picker.render(width),
+			handleInput: (data) => {
+				picker.handleInput(data);
+				tui.requestRender();
+			},
+			invalidate: () => picker.invalidate(),
+		};
+	});
+}
+
 async function chooseAction(ctx: ExtensionCommandContext, issue: Issue): Promise<PickupAction | undefined> {
 	const choice = await ctx.ui.select(`Pick up #${issue.number}: ${issue.title}`, [
 		"Create a branch and start working",
@@ -316,7 +407,7 @@ async function listBaseBranches(
 	]
 		.map((branch) => branch.trim())
 		.filter((branch) => branch && branch !== "origin/HEAD")
-		.slice(0, 25);
+		.slice(0, MAX_BASE_BRANCHES);
 	return [...new Set(candidates)];
 }
 
@@ -325,8 +416,9 @@ async function chooseBranchName(
 	ctx: ExtensionCommandContext,
 	issue: Issue,
 	base: string,
+	githubLogin: string,
 ): Promise<string | undefined> {
-	let suggestion = branchSlug(issue);
+	let suggestion = branchSlug(issue, githubLogin);
 	for (;;) {
 		const branch = (await ctx.ui.input("New branch name", suggestion))?.trim();
 		if (!branch) return undefined;
@@ -403,13 +495,14 @@ async function prepareBranch(
 	ctx: ExtensionCommandContext,
 	issue: Issue,
 	defaultBranch: string,
+	githubLogin: string,
 ): Promise<{ branch: string | undefined; base: string | undefined; stashed: string | undefined }> {
 	const dirty = await handleDirtyTree(pi, ctx, issue);
 	if (!dirty.proceed) return { branch: undefined, base: undefined, stashed: undefined };
 
 	try {
 		const bases = await listBaseBranches(pi, ctx, defaultBranch);
-		const base = await ctx.ui.select("Branch from", [...bases, "Enter another ref…"]);
+		const base = await chooseFuzzyString(ctx, "Branch from", [...bases, "Enter another ref…"]);
 		if (!base) throw new Error("Branch setup cancelled");
 		const selectedBase =
 			base === "Enter another ref…"
@@ -426,7 +519,7 @@ async function prepareBranch(
 			if (fetch.code !== 0) throw new Error(commandError(`git fetch origin ${remoteBranch}`, fetch));
 		}
 
-		const branch = await chooseBranchName(pi, ctx, issue, selectedBase);
+		const branch = await chooseBranchName(pi, ctx, issue, selectedBase, githubLogin);
 		if (!branch) throw new Error("Branch setup cancelled");
 		return { branch, base: selectedBase, stashed: dirty.stashed };
 	} catch (error) {
@@ -521,7 +614,7 @@ export default function (pi: ExtensionAPI) {
 				let base: string | undefined;
 				let stashed: string | undefined;
 				if (action === "branch") {
-					const prepared = await prepareBranch(pi, ctx, issue, repo.defaultBranchRef.name);
+					const prepared = await prepareBranch(pi, ctx, issue, repo.defaultBranchRef.name, user.login);
 					branch = prepared.branch;
 					base = prepared.base;
 					stashed = prepared.stashed;
