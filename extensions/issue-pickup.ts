@@ -732,6 +732,20 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			try {
+				const sessionHasMessages = ctx.sessionManager
+					.getBranch()
+					.some((entry) => entry.type === "message" || entry.type === "custom_message");
+				let useNewSession = false;
+				if (sessionHasMessages) {
+					const sessionChoice = await ctx.ui.select("This session already has messages. Where should the issue be picked up?", [
+						"Start a new session",
+						"Continue in this session",
+						"Cancel",
+					]);
+					if (sessionChoice === "Start a new session") useNewSession = true;
+					else if (sessionChoice !== "Continue in this session") return;
+				}
+
 				const [repo, user] = await Promise.all([
 					readJson<RepoInfo>(pi, ctx, "gh", ["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"]),
 					readJson<UserInfo>(pi, ctx, "gh", ["api", "user"]),
@@ -788,36 +802,65 @@ export default function (pi: ExtensionAPI) {
 					statusBranch = currentBranch.code === 0 ? currentBranch.stdout.trim() || undefined : undefined;
 				}
 
+				const issueContext = buildIssueContext(repo, issue, branch, base);
+				const issueDetails: IssueContextDetails = {
+					repo: repo.nameWithOwner,
+					issue: issue.number,
+					url: issue.url,
+					branch,
+					statusBranch,
+					base,
+				};
+				const sessionName = `#${issue.number} — ${issue.title}`;
+				const editorText = branch
+					? `Let's work on #${issue.number}. First, review the issue and research the relevant code. Then give me: (1) a brief summary of the issue in your own words, (2) what you found in the code, and (3) possible solution approaches with trade-offs. Discuss these with me and wait for my go-ahead before making any changes.`
+					: `Help me understand #${issue.number}. Research the relevant code, then give me: (1) a brief summary of the issue in your own words, (2) what you found in the code, and (3) possible solution approaches with trade-offs. Let's discuss before deciding how to proceed.`;
+				const notifyText = stashed
+					? `Created ${branch}; previous changes remain in ${stashed}`
+					: branch
+						? `Ready on ${branch}`
+						: `Loaded issue #${issue.number}`;
+				const notifyLevel = stashed ? ("warning" as const) : ("info" as const);
+
+				if (useNewSession) {
+					const parentSession = ctx.sessionManager.getSessionFile();
+					const result = await ctx.newSession({
+						parentSession,
+						setup: async (sm) => {
+							sm.appendSessionInfo(sessionName);
+							sm.appendMessage({
+								role: "custom",
+								customType: ISSUE_CONTEXT_TYPE,
+								content: issueContext,
+								display: true,
+								details: issueDetails,
+								timestamp: Date.now(),
+							});
+						},
+						withSession: async (newCtx) => {
+							newCtx.ui.setEditorText(editorText);
+							newCtx.ui.notify(notifyText, notifyLevel);
+						},
+					});
+					if (!result.cancelled) return;
+					ctx.ui.notify("New session was cancelled; loading issue into the current session", "warning");
+				}
+
 				pi.sendMessage(
 					{
 						customType: ISSUE_CONTEXT_TYPE,
-						content: buildIssueContext(repo, issue, branch, base),
+						content: issueContext,
 						display: true,
-						details: {
-							repo: repo.nameWithOwner,
-							issue: issue.number,
-							url: issue.url,
-							branch,
-							statusBranch,
-							base,
-						},
+						details: issueDetails,
 					},
 					{ deliverAs: "nextTurn" },
 				);
-				pi.setSessionName(`#${issue.number} — ${issue.title}`);
+				pi.setSessionName(sessionName);
 				activeIssue = { number: issue.number, url: issue.url };
 				activeIssueBranch = statusBranch;
 				setIssueStatus(ctx, activeIssue);
-				ctx.ui.setEditorText(
-					branch
-						? `Let's work on #${issue.number}. Start by reviewing the issue and locating the relevant code before making changes.`
-						: `Help me understand #${issue.number} and identify the relevant code and a good implementation approach.`,
-				);
-				if (stashed) {
-					ctx.ui.notify(`Created ${branch}; previous changes remain in ${stashed}`, "warning");
-				} else {
-					ctx.ui.notify(branch ? `Ready on ${branch}` : `Loaded issue #${issue.number}`, "info");
-				}
+				ctx.ui.setEditorText(editorText);
+				ctx.ui.notify(notifyText, notifyLevel);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				if (!message.endsWith("cancelled")) ctx.ui.notify(`/pickup: ${message}`, "error");
