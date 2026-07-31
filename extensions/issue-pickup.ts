@@ -15,6 +15,7 @@ import {
 	truncateToWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { onBranchChange } from "./lib/branch-signal";
 
 const COMMAND_TIMEOUT_MS = 15_000;
 const MAX_ISSUES = 100;
@@ -654,6 +655,7 @@ export default function (pi: ExtensionAPI) {
 	let lastIssueCheck = 0;
 	let refreshingIssue = false;
 	let issueTimer: ReturnType<typeof setInterval> | undefined;
+	let unsubscribeBranchSignal: (() => void) | undefined;
 
 	const refreshIssueStatus = async (ctx: ExtensionContext, force = false) => {
 		if (refreshingIssue) return;
@@ -715,11 +717,14 @@ export default function (pi: ExtensionAPI) {
 		lastIssueCheck = 0;
 		await refreshIssueStatus(ctx, true);
 		issueTimer = setInterval(() => void refreshIssueStatus(ctx), BRANCH_POLL_INTERVAL_MS);
+		unsubscribeBranchSignal = onBranchChange(() => void refreshIssueStatus(ctx, true));
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (issueTimer) clearInterval(issueTimer);
 		issueTimer = undefined;
+		unsubscribeBranchSignal?.();
+		unsubscribeBranchSignal = undefined;
 		setIssueStatus(ctx, undefined);
 	});
 

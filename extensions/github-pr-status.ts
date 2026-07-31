@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { onBranchChange } from "./lib/branch-signal";
 
 const STATUS_ID = "github-pr";
 const BRANCH_POLL_INTERVAL_MS = 60_000;
@@ -21,6 +22,7 @@ function truncateTitle(title: string): string {
 
 export default function (pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
+	let unsubscribeBranchSignal: (() => void) | undefined;
 	let refreshing = false;
 	let lastBranch: string | undefined;
 	let lastPullRequestCheck = 0;
@@ -88,11 +90,14 @@ export default function (pi: ExtensionAPI) {
 		lastPullRequestCheck = 0;
 		await refresh(ctx, true);
 		timer = setInterval(() => void refresh(ctx), BRANCH_POLL_INTERVAL_MS);
+		unsubscribeBranchSignal = onBranchChange(() => void refresh(ctx, true));
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (timer) clearInterval(timer);
 		timer = undefined;
+		unsubscribeBranchSignal?.();
+		unsubscribeBranchSignal = undefined;
 		clearStatus(ctx);
 	});
 
