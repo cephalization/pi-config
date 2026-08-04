@@ -33,6 +33,7 @@ pi update --extensions
 - `council.ts` — `/council <models...>` enables a persistent council of randomly named, independently opinionated model advisers. While enabled, each prompt is sent to every elder in a randomized sequential order using read-only repository tools. Use `/council` to toggle, `/council off`, or `/council status`.
 - `github-pr-status.ts` — shows the pull request associated with the current Git branch in Pi's footer.
 - `issue-pickup.ts` — `/pickup [filter]` finds assigned issues in the current GitHub repository, optionally creates a `<github-login>/issue/...` branch from a fuzzy-searchable base, loads the issue into the session context, and restores or infers the active issue status from the branch and its PR.
+- `native-web-search.ts` — enables provider-hosted web search on every request for OpenAI Responses, OpenAI Codex, OpenAI Chat Completions, and Anthropic Messages models. Unsupported models surface their provider API error normally.
 
 ### Council examples
 
