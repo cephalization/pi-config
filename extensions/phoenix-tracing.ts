@@ -280,6 +280,7 @@ export default function (pi: ExtensionAPI) {
     content: string;
     toolCallId?: string;
     toolName?: string;
+    toolCalls?: Array<{ id: string; name: string; arguments: string }>;
   }> = [];
   let llmStartMs: number | undefined;
   const pendingTools = new Map<string, PendingTool>();
@@ -391,12 +392,24 @@ export default function (pi: ExtensionAPI) {
   pi.on("context", async (event) => {
     if (!active() || !config.captureMessages) return;
     try {
-      contextMessages = (event.messages ?? []).map((m: any) => ({
-        role: m.role === "toolResult" ? "tool" : String(m.role ?? "unknown"),
-        content: textOfContent(m.content),
-        toolCallId: m.role === "toolResult" ? String(m.toolCallId ?? "") : undefined,
-        toolName: m.role === "toolResult" ? String(m.toolName ?? "") : undefined,
-      }));
+      contextMessages = (event.messages ?? []).map((m: any) => {
+        const toolCalls = Array.isArray(m.content)
+          ? m.content
+              .filter((c: any) => c?.type === "toolCall")
+              .map((c: any) => ({
+                id: String(c.id ?? ""),
+                name: String(c.name ?? ""),
+                arguments: JSON.stringify(c.arguments ?? {}),
+              }))
+          : [];
+        return {
+          role: m.role === "toolResult" ? "tool" : String(m.role ?? "unknown"),
+          content: textOfContent(m.content),
+          toolCallId: m.role === "toolResult" ? String(m.toolCallId ?? "") : undefined,
+          toolName: m.role === "toolResult" ? String(m.toolName ?? "") : undefined,
+          toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        };
+      });
     } catch {
       /* fail-soft */
     }
@@ -494,13 +507,27 @@ export default function (pi: ExtensionAPI) {
             : contextMessages;
         kept.forEach((m, i) => {
           attrs[`llm.input_messages.${i}.message.role`] = m.role;
-          attrs[`llm.input_messages.${i}.message.content`] = redact(
-            config.logPrompts,
-            m.content,
-            config.maxMessageLength,
-          );
+          // Omit empty content (e.g. tool-call-only assistant turns) rather than
+          // exporting "" — the tool_calls attributes below carry the payload.
+          if (m.content) {
+            attrs[`llm.input_messages.${i}.message.content`] = redact(
+              config.logPrompts,
+              m.content,
+              config.maxMessageLength,
+            );
+          }
           if (m.toolCallId) attrs[`llm.input_messages.${i}.message.tool_call_id`] = m.toolCallId;
           if (m.toolName) attrs[`llm.input_messages.${i}.message.name`] = m.toolName;
+          for (const [j, call] of (m.toolCalls ?? []).entries()) {
+            const prefix = `llm.input_messages.${i}.message.tool_calls.${j}.tool_call`;
+            attrs[`${prefix}.id`] = call.id;
+            attrs[`${prefix}.function.name`] = call.name;
+            attrs[`${prefix}.function.arguments`] = redact(
+              config.logToolContent,
+              call.arguments,
+              config.maxMessageLength,
+            );
+          }
         });
         if (kept.length < contextMessages.length) {
           attrs["metadata"] = JSON.stringify({
@@ -509,11 +536,13 @@ export default function (pi: ExtensionAPI) {
           });
         }
         attrs["llm.output_messages.0.message.role"] = "assistant";
-        attrs["llm.output_messages.0.message.content"] = redact(
-          config.logPrompts,
-          outputText,
-          config.maxMessageLength,
-        );
+        if (outputText) {
+          attrs["llm.output_messages.0.message.content"] = redact(
+            config.logPrompts,
+            outputText,
+            config.maxMessageLength,
+          );
+        }
         let callIndex = 0;
         for (const item of message.content ?? []) {
           if (item?.type !== "toolCall") continue;
