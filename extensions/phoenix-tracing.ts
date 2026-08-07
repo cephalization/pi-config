@@ -23,7 +23,7 @@
  *
  * {
  *   "enabled": true,
- *   "logPrompts": true,          // false => "<redacted (N chars)>" for prompt/completion values
+ *   "logPrompts": true,          // false => "__REDACTED__" for prompt/completion values
  *   "logToolContent": true,      // false => redact tool input/output
  *   "captureMessages": true,     // llm.input_messages.* / llm.output_messages.* attributes
  *   "captureTools": true,        // llm.tools.*.tool.json_schema (advertised tool definitions)
@@ -217,9 +217,12 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max)}… [truncated ${text.length - max} chars]`;
 }
 
+/** OpenInference standard placeholder for intentionally hidden content. */
+const REDACTED = "__REDACTED__";
+
 function redact(allowed: boolean, text: string, max: number): string {
   const value = text ?? "";
-  if (!allowed) return `<redacted (${value.length} chars)>`;
+  if (!allowed) return REDACTED;
   return truncate(value, max);
 }
 
@@ -280,8 +283,65 @@ export default function (pi: ExtensionAPI) {
     content: string;
     toolCallId?: string;
     toolName?: string;
-    toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+    toolCalls?: Array<{ id: string; name: string; arguments: string; reasoningSignature?: string }>;
+    parts?: any[];
   }> = [];
+
+  /**
+   * Flatten ordered content parts into `<prefix>.message.contents.*` per the
+   * OpenInference multimodal/reasoning conventions. pi content items map as:
+   *   text     -> message_content.type="text" (+ .signature from textSignature)
+   *   thinking -> message_content.type="reasoning" (+ .signature; redacted blocks
+   *               export .data instead of .text, like Anthropic redacted_thinking)
+   *   toolCall -> message_content.type="tool_use" with tool_call.* fields
+   *               (+ tool_call.reasoning_signature from thoughtSignature)
+   * Only emitted when ordering matters: multiple parts or any non-text part.
+   */
+  function flattenContentParts(
+    prefix: string,
+    parts: any[],
+    attrs: Record<string, unknown>,
+  ): void {
+    if (!Array.isArray(parts)) return;
+    const meaningful = parts.filter((p) => p && typeof p === "object");
+    if (meaningful.length <= 1 && meaningful.every((p) => p.type === "text")) return;
+    meaningful.forEach((item, j) => {
+      const c = `${prefix}.message.contents.${j}.message_content`;
+      if (item.type === "text") {
+        attrs[`${c}.type`] = "text";
+        attrs[`${c}.text`] = redact(
+          config.logPrompts,
+          String(item.text ?? ""),
+          config.maxMessageLength,
+        );
+        if (item.textSignature) attrs[`${c}.signature`] = String(item.textSignature);
+      } else if (item.type === "thinking") {
+        attrs[`${c}.type`] = "reasoning";
+        if (item.redacted) {
+          // Redacted thinking: opaque encrypted payload lives in thinkingSignature.
+          if (item.thinkingSignature) attrs[`${c}.data`] = String(item.thinkingSignature);
+        } else {
+          attrs[`${c}.text`] = redact(
+            config.logPrompts,
+            String(item.thinking ?? ""),
+            config.maxMessageLength,
+          );
+          if (item.thinkingSignature) attrs[`${c}.signature`] = String(item.thinkingSignature);
+        }
+      } else if (item.type === "toolCall") {
+        attrs[`${c}.type`] = "tool_use";
+        const t = `${prefix}.message.contents.${j}.tool_call`;
+        attrs[`${t}.id`] = String(item.id ?? "");
+        attrs[`${t}.function.name`] = String(item.name ?? "");
+        attrs[`${t}.function.arguments`] = redact(
+          config.logToolContent,
+          JSON.stringify(item.arguments ?? {}),
+          config.maxMessageLength,
+        );
+        if (item.thoughtSignature) attrs[`${t}.reasoning_signature`] = String(item.thoughtSignature);
+      }
+    });
+  }
   let llmStartMs: number | undefined;
   const pendingTools = new Map<string, PendingTool>();
   // Advertised tool definitions, refreshed per agent run: flattened llm.tools.* attrs
@@ -400,6 +460,7 @@ export default function (pi: ExtensionAPI) {
                 id: String(c.id ?? ""),
                 name: String(c.name ?? ""),
                 arguments: JSON.stringify(c.arguments ?? {}),
+                reasoningSignature: c.thoughtSignature ? String(c.thoughtSignature) : undefined,
               }))
           : [];
         return {
@@ -408,6 +469,7 @@ export default function (pi: ExtensionAPI) {
           toolCallId: m.role === "toolResult" ? String(m.toolCallId ?? "") : undefined,
           toolName: m.role === "toolResult" ? String(m.toolName ?? "") : undefined,
           toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          parts: m.role === "assistant" && Array.isArray(m.content) ? m.content : undefined,
         };
       });
     } catch {
@@ -447,6 +509,8 @@ export default function (pi: ExtensionAPI) {
       const outputText = textOfContent(message.content);
       const model = String(message.responseModel ?? message.model ?? "");
       const toolCalls = (message.content ?? []).filter((c: any) => c?.type === "toolCall");
+      const meta: Record<string, unknown> = { harness: "pi" };
+      if (message.responseId) meta.response_id = String(message.responseId);
 
       const attrs: Record<string, unknown> = {
         "openinference.span.kind": "LLM",
@@ -527,13 +591,14 @@ export default function (pi: ExtensionAPI) {
               call.arguments,
               config.maxMessageLength,
             );
+            if (call.reasoningSignature) {
+              attrs[`${prefix}.reasoning_signature`] = call.reasoningSignature;
+            }
           }
+          if (m.parts) flattenContentParts(`llm.input_messages.${i}`, m.parts, attrs);
         });
         if (kept.length < contextMessages.length) {
-          attrs["metadata"] = JSON.stringify({
-            harness: "pi",
-            input_messages_truncated: contextMessages.length - kept.length,
-          });
+          meta.input_messages_truncated = contextMessages.length - kept.length;
         }
         attrs["llm.output_messages.0.message.role"] = "assistant";
         if (outputText) {
@@ -554,9 +619,15 @@ export default function (pi: ExtensionAPI) {
             JSON.stringify(item.arguments ?? {}),
             config.maxMessageLength,
           );
+          if (item.thoughtSignature) {
+            attrs[`${prefix}.reasoning_signature`] = String(item.thoughtSignature);
+          }
           callIndex++;
         }
+        // Ordered content parts: reasoning, signatures, and tool_use positioning.
+        flattenContentParts("llm.output_messages.0", message.content ?? [], attrs);
       }
+      attrs["metadata"] = JSON.stringify(meta);
 
       const isError = message.stopReason === "error";
       emit({
