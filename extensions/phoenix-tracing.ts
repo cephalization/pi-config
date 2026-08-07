@@ -25,6 +25,8 @@
  *   "enabled": true,
  *   "logPrompts": true,          // false => "__REDACTED__" for prompt/completion values
  *   "logToolContent": true,      // false => redact tool input/output
+ *   "emitCosts": false,          // llm.cost.* attrs; off by default so Phoenix
+ *                                // (Settings -> Models) owns cost computation
  *   "captureMessages": true,     // llm.input_messages.* / llm.output_messages.* attributes
  *   "captureTools": true,        // llm.tools.*.tool.json_schema (advertised tool definitions)
  *   "maxValueLength": 20000,     // truncation cap for input.value / output.value
@@ -75,6 +77,7 @@ interface TracingConfig {
   logToolContent: boolean;
   captureMessages: boolean;
   captureTools: boolean;
+  emitCosts: boolean;
   maxValueLength: number;
   maxMessageLength: number;
   maxInputMessages: number;
@@ -87,6 +90,7 @@ const DEFAULTS: TracingConfig = {
   logToolContent: true,
   captureMessages: true,
   captureTools: true,
+  emitCosts: false,
   maxValueLength: 20_000,
   maxMessageLength: 4_000,
   maxInputMessages: 0,
@@ -199,8 +203,21 @@ class PhoenixTarget {
     }
   }
 
-  async drain(timeoutMs = 5_000): Promise<void> {
-    await Promise.race([this.chain, new Promise((r) => setTimeout(r, timeoutMs))]);
+  /**
+   * Flush everything before shutdown. Waits for the in-flight chain AND any
+   * spans enqueued after the chain was captured (e.g. the Turn root emitted
+   * during session_shutdown). The deadline must exceed the 10s fetch timeout,
+   * otherwise the final batch — which contains the parent spans — is abandoned
+   * mid-request and silently dropped.
+   */
+  async drain(timeoutMs = 15_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const chain = this.chain;
+      await Promise.race([chain, new Promise((r) => setTimeout(r, deadline - Date.now()))]);
+      // Settled and nothing new arrived: fully drained.
+      if (this.chain === chain && this.queue.length === 0) return;
+    }
   }
 }
 
@@ -449,10 +466,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Snapshot the exact messages sent to the LLM, for llm.input_messages.*
-  pi.on("context", async (event) => {
+  pi.on("context", async (event, ctx) => {
     if (!active() || !config.captureMessages) return;
     try {
-      contextMessages = (event.messages ?? []).map((m: any) => {
+      // System prompt first, as a system-role message — required for analyzing
+      // prompt cache behavior and tool descriptions.
+      let systemPrompt = "";
+      try {
+        systemPrompt = (ctx as any).getSystemPrompt?.() ?? "";
+      } catch {
+        /* fail-soft */
+      }
+      const system = systemPrompt
+        ? [{ role: "system", content: systemPrompt } as any]
+        : [];
+      contextMessages = [...system, ...(event.messages ?? [])].map((m: any) => {
         const toolCalls = Array.isArray(m.content)
           ? m.content
               .filter((c: any) => c?.type === "toolCall")
@@ -554,7 +582,7 @@ export default function (pi: ExtensionAPI) {
       if (reasoning) attrs["llm.token_count.completion_details.reasoning"] = reasoning;
       if (cacheRead) attrs["llm.token_count.prompt_details.cache_read"] = cacheRead;
       if (cacheWrite) attrs["llm.token_count.prompt_details.cache_write"] = cacheWrite;
-      if (costTotal) {
+      if (config.emitCosts && costTotal) {
         attrs["llm.cost.total"] = costTotal;
         attrs["llm.cost.prompt"] = costInput + costCacheRead + costCacheWrite;
         attrs["llm.cost.completion"] = costOutput;
@@ -577,7 +605,9 @@ export default function (pi: ExtensionAPI) {
             attrs[`llm.input_messages.${i}.message.content`] = redact(
               config.logPrompts,
               m.content,
-              config.maxMessageLength,
+              // System prompts get the larger budget: cache and tool-description
+              // analysis needs the full prompt, not a 4KB prefix.
+              m.role === "system" ? config.maxValueLength : config.maxMessageLength,
             );
           }
           if (m.toolCallId) attrs[`llm.input_messages.${i}.message.tool_call_id`] = m.toolCallId;
